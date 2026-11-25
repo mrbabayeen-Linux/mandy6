@@ -72,7 +72,7 @@ TOOLS = os.path.join(ROOT, "tools")
 sys.path.insert(0, TOOLS)
 from mc_command import install_hint as mc_install_hint, mc_command, split_command  # noqa: E402
 import leonida_tui  # noqa: E402
-from shader_stage_manifest import shader_stems  # noqa: E402
+from shader_stage_manifest import shader_stages, shader_stems  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
 from stale_build import newer_sources  # noqa: E402
 
@@ -1535,7 +1535,7 @@ LIBRARY_TOOLS = ("shader_library.py", "shader_carve.py", "shader_carve_accel.py"
 
 
 def library_settings(archive: str, mc_signature: str, emulate: bool, fallbacks: tuple[str, ...]) -> str:
-    """What the pipeline library's compute translations depend on, as one line: shaders.rpf, the unpacking and
+    """What the pipeline library's translations depend on, as one line: shaders.rpf, the unpacking and
     translating tools, llvm-mc, the wave64 mode and the fallback flags."""
     return json.dumps({"archive": file_sha256(archive), "tools": sources_digest(TOOLS, LIBRARY_TOOLS),
                        "translator": translation_sources_digest(), "llvm_mc": mc_signature,
@@ -1544,31 +1544,38 @@ def library_settings(archive: str, mc_signature: str, emulate: bool, fallbacks: 
 
 def library_shaders(game: str, work: str, mc_signature: str, jobs: int, emulate: bool = False,
                     fallbacks: tuple[str, ...] = ()) -> None:
-    """The compute pipelines of the pipeline library in shaders.rpf (docs/shader_library.md). The executable reads
-    the library through DirectStorage and creates each compute pipeline with Xbox device slot 67
-    (DeserializeComputePipelineStateX), passing the record's four parts as FSPX kinds 0, 1, 6 and 7 (docs/fspx.md).
-    tools/shader_library.py unpacks the compute programs with their kind-0 state into <work>/shaders/library, and
-    translate() runs rdna2spirv.py across jobs processes into <work>/shaders/spirv/library, where the runtime's
-    shader library finds them by fspx_code_sha256 and fspx_state_sha256 as it finds the FidelityFX DLL's. Graphics
-    pipelines are not translated here. The game's own shaders neither feed nor depend on this step, apart from the
-    carve that names each program's source container (the translator reads its signatures).
-
-    The step runs whole. Reuse requires the translation index, its named modules and a matching library_build.json
-    (library_settings)."""
+    """Build the pipeline-library programs used by Xbox slots 67 (compute) and 57 (graphics).
+    Each directory has its own index and build marker so an existing compute translation can be reused."""
     archive = os.path.join(game, LIBRARY_ARCHIVE)
-    unpacked = os.path.join(work, "shaders", "library")
-    spirv = os.path.join(work, "shaders", "spirv", "library")
+    settings = library_settings(archive, mc_signature, emulate, fallbacks) if os.path.isfile(archive) else None
+    if settings is None:
+        log(f"shaders: no {LIBRARY_ARCHIVE} in the game folder, so no pipeline library to translate")
+    for folder, stages in (("library", ("cs",)), ("fspx_gfx", ("ps", "vs", "ms"))):
+        translate_library_stages(archive, work, folder, stages, settings, jobs, emulate, fallbacks)
+
+
+def translate_library_stages(archive: str, work: str, folder_name: str, stages: tuple[str, ...],
+                             settings: str | None, jobs: int, emulate: bool, fallbacks: tuple[str, ...]) -> None:
+    unpacked = os.path.join(work, "shaders", folder_name)
+    spirv = os.path.join(work, "shaders", "spirv", folder_name)
     translated = os.path.join(spirv, "index.json")
     shard_plan = os.path.join(spirv, SHARD_PLAN)
     settings_file = os.path.join(spirv, "library_build.json")
-    if not os.path.isfile(archive):
+    if settings is None:
         drop(translated, settings_file, shard_plan)
-        log(f"shaders: no {LIBRARY_ARCHIVE} in the game folder, so no pipeline library to translate")
         return
-    settings = library_settings(archive, mc_signature, emulate, fallbacks)
-    if read_shader_setting(settings_file) == settings and fspx_cache_complete(spirv):
-        return
-    log(f"shaders: unpacking and translating the compute pipelines of the pipeline library in {LIBRARY_ARCHIVE}")
+    graphics = folder_name == "fspx_gfx"
+    saved = read_shader_setting(settings_file)
+    if saved:
+        if graphics:
+            if saved == graphics_library_stamp(unpacked, spirv, settings):
+                report_graphics_library(saved)
+                return
+        elif saved == settings and (fspx_cache_complete(spirv) or
+                                    (read_shader_setting(translated) == "{}" and empty_library_selection(unpacked))):
+            return
+    stage_list = ",".join(stages)
+    log(f"shaders: unpacking and translating pipeline library programs ({stage_list}) in {LIBRARY_ARCHIVE}")
     drop(translated, settings_file, shard_plan)
     # A program that no longer translates or lost its carve container must not keep outputs from the run before.
     for folder, suffixes in ((unpacked, (".dxbc",)),
@@ -1581,12 +1588,58 @@ def library_shaders(game: str, work: str, mc_signature: str, jobs: int, emulate:
                     if entry.name.endswith(suffixes) and entry.is_file(follow_symlinks=False):
                         os.unlink(entry.path)
     carve = os.path.join(work, "shaders", "dxbc")
-    py("shader_library.py", archive, "--out", unpacked, "--stages", "cs", "--disasm", "--jobs", str(jobs),
+    py("shader_library.py", archive, "--out", unpacked, "--stages", stage_list, "--disasm", "--jobs", str(jobs),
        *(["--carve", carve] if os.path.isdir(carve) else []))
-    translate(os.path.join(unpacked, "disasm"), spirv, jobs, emulate=emulate, fallbacks=fallbacks)
+    if empty_library_selection(unpacked):
+        # A library with only one pipeline type has a valid, empty selection for the other.
+        os.makedirs(spirv, exist_ok=True)
+        with open(translated, "w", encoding="utf-8", newline="\n") as f:
+            f.write("{}\n")
+    else:
+        translate(os.path.join(unpacked, "disasm"), spirv, jobs, emulate=emulate, fallbacks=fallbacks)
     verify_fspx_key_clash(spirv, translated, "pipeline library")
+    if graphics:
+        settings = graphics_library_stamp(unpacked, spirv, settings)
+        if settings is None:
+            drop(translated)
+            fail("shaders: the graphics pipeline library index has missing modules or unusable stage/hash metadata")
+        report_graphics_library(settings)
     with open(settings_file, "w", encoding="utf-8", newline="\n") as f:
         f.write(settings + "\n")
+
+
+def empty_library_selection(unpacked: str) -> bool:
+    try:
+        return not shader_stems(os.path.join(unpacked, "index.json"), "file", ".dxbc")
+    except (OSError, ValueError):
+        return False
+
+
+def graphics_library_stamp(unpacked: str, spirv: str, settings: str) -> str | None:
+    """Bind the build marker to the published index, including its coverage when a translation is refused."""
+    try:
+        extracted = shader_stages(os.path.join(unpacked, "index.json"), "file", ".dxbc")
+        with open(os.path.join(spirv, "index.json"), "rb") as f:
+            data = f.read()
+        index = json.loads(data)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(index, dict) or (extracted and not index):
+        return None
+    for name, meta in index.items():
+        stage = extracted.get(name)
+        if (stage not in ("ps", "vs", "ms") or not isinstance(meta, dict) or meta.get("stage") != stage
+                or not isinstance(meta.get("fspx_code_sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", meta["fspx_code_sha256"])
+                or not os.path.isfile(os.path.join(spirv, name + ".spv"))):
+            return None
+    return json.dumps({"inputs": json.loads(settings), "index_sha256": hashlib.sha256(data).hexdigest(),
+                       "translated": len(index), "programs": len(extracted)}, sort_keys=True)
+
+
+def report_graphics_library(stamp: str) -> None:
+    result = json.loads(stamp)
+    log(f"shaders: {result['translated']} of {result['programs']} graphics pipeline library programs translated")
 
 
 def verify_fspx_key_clash(spirv: str, translated: str, label: str) -> None:

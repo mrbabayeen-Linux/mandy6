@@ -5258,9 +5258,8 @@ std::uint64_t proxy_create_committed_resource(DeviceProxy* self, std::uint64_t a
 }
 
 // Xbox slot 57 through the factory of the device behind the proxy (set_device_native_graphics_factory), which
-// takes the whole description. E_NOTIMPL (no factory, or one that cannot build this description) sends the call
-// to proxy_create_graphics_pipeline_from_native_code below.
-HRESULT proxy_create_native_graphics(DeviceProxy* self, const void* raw, REFIID riid, void** out) {
+// takes all seven stage blocks. The legacy description below can carry only the first two.
+HRESULT proxy_create_native_graphics(DeviceProxy* self, const void* raw, REFIID riid, void** out, bool& legacy_shape) {
     namespace np = leonida::native_pso;
     if (!out) return E_POINTER;
     *out = nullptr;
@@ -5268,6 +5267,9 @@ HRESULT proxy_create_native_graphics(DeviceProxy* self, const void* raw, REFIID 
     if (!accessible_range(raw, sizeof(np::GraphicsDesc), false)) return E_INVALIDARG;
     np::GraphicsDesc desc{};
     std::memcpy(&desc, raw, sizeof(desc));
+    legacy_shape = std::none_of(desc.stages + 2, std::end(desc.stages), [](const np::StageBlock& stage) {
+        return stage.code.size || stage.records.size;
+    });
     const auto readable_pair = [](const np::Pair& pair) {
         const auto state = np::pair_state(pair);
         return state == np::PairState::absent ||
@@ -6388,10 +6390,11 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             note_slot(57);
             log_xbox_route_once(57, "DeserializeGraphicsPipelineStateX", a1, a2, a3, a4, a5);
             HRESULT hr = E_NOTIMPL;
+            bool legacy_shape = true;
             if (riid && self->native_graphics)
                 hr = proxy_create_native_graphics(self, reinterpret_cast<const void*>(a1), *riid,
-                                                  reinterpret_cast<void**>(a3));
-            if (hr == E_NOTIMPL)
+                                                  reinterpret_cast<void**>(a3), legacy_shape);
+            if (hr == E_NOTIMPL && legacy_shape)
                 hr = proxy_create_graphics_pipeline_from_native_code(
                     self, reinterpret_cast<const void*>(a1), riid, reinterpret_cast<void**>(a3));
             return hr_to_u64(d3d12_trace::result("XboxID3D12Device::CreateNativeGraphicsPipelineState", hr));

@@ -489,13 +489,14 @@ private:
 
 struct PlannedStage {
     std::size_t block = 0;
-    const ShaderRef* shader = nullptr;
+    std::string_view stage;
+    const ShaderRef* container = nullptr;  // otherwise use the block's indexed kind-6 program
 };
 
 enum class PlanStatus {
     ok,
     malformed,    // a pair is malformed or blob B does not decode
-    missing,      // a stage has no records, or its digest names no translated container
+    missing,      // neither its records nor its code identify a translated stage
     ambiguous,    // a stage's records name two different containers
     unsupported,  // a stage kind this path does not build (hs, ds, cs), two of one kind, or no VS/MS
 };
@@ -508,14 +509,15 @@ struct Plan {
     const char* reason = "";           // why a description is malformed
     bool mesh = false;                 // an MS stage: the pipeline goes through a pipeline state stream
 
-    const ShaderRef* stage(std::string_view name) const {
+    bool has_stage(std::string_view name) const {
         for (const PlannedStage& s : stages)
-            if (s.shader->stage == name) return s.shader;
-        return nullptr;
+            if (s.stage == name) return true;
+        return false;
     }
 };
 
-inline Plan plan(const GraphicsDesc& desc, const HashMap& map) {
+template<class CodeStage>
+inline Plan plan(const GraphicsDesc& desc, const HashMap& map, CodeStage&& code_stage) {
     Plan p;
     if (pair_state(desc.state_a) == PairState::malformed) {
         p.reason = "blob A pair malformed";
@@ -541,36 +543,40 @@ inline Plan plan(const GraphicsDesc& desc, const HashMap& map) {
             return p;
         }
         if (code == PairState::absent && records == PairState::absent) continue;
-        if (records != PairState::present) {  // code without records: nothing names its container
-            p.status = PlanStatus::missing;
-            return p;
-        }
         const ShaderRef* found = nullptr;
         for (const Digest& d : record_digests(bytes(block.records))) {
             const ShaderRef* ref = map.find(d);
             if (!ref) continue;
             if (found && found != ref) {
                 p.status = PlanStatus::ambiguous;
+                p.reason = "stage records name two different shader containers";
                 p.failed_block = k;
                 return p;
             }
             found = ref;
         }
         p.failed_block = k;
-        if (!found) {
+        // Prefer the container named by the records. A bare program can also name its stage
+        // by the exact kind-6 digest published in fspx_gfx/index.json.
+        std::string_view s;
+        if (found) s = found->stage;
+        else if (code == PairState::present) s = code_stage(block.code);
+        if (s.empty()) {
             p.status = PlanStatus::missing;
+            p.reason = "no matching DXBC identity or indexed native program";
             return p;
         }
-        const std::string& s = found->stage;
-        if (!(s == "vs" || s == "ps" || s == "gs" || s == "ms") || p.stage(s)) {
+        if (!(s == "vs" || s == "ps" || s == "gs" || s == "ms") || p.has_stage(s)) {
             p.status = PlanStatus::unsupported;
+            p.reason = "unsupported or duplicate graphics stage";
             return p;
         }
-        p.stages.push_back({k, found});
+        p.stages.push_back({k, s, found});
     }
-    const bool vs = p.stage("vs"), ms = p.stage("ms");
-    if (vs == ms || (ms && p.stage("gs"))) {
+    const bool vs = p.has_stage("vs"), ms = p.has_stage("ms");
+    if (vs == ms || (ms && p.has_stage("gs"))) {
         p.status = PlanStatus::unsupported;
+        p.reason = "invalid vertex, mesh or geometry stage combination";
         return p;
     }
     p.mesh = ms;

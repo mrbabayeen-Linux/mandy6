@@ -2926,6 +2926,14 @@ int check_slot57_native_graphics() {
         EXPECT(g_factory_calls == asked + 1 && out == nullptr && mock->calls[10] == 2);
     }
 
+    // A two-program fallback would silently omit this occupied block.
+    const unsigned stage_word = 0;
+    desc.stages[6].code = {&stage_word, sizeof(stage_word)};
+    g_factory_result = E_NOTIMPL;
+    EXPECT(hr_of(raw(device, 57, word(&desc), word(&pipeline_iid), word(&out))) == E_NOTIMPL);
+    EXPECT(out == nullptr && mock->calls[10] == 2);
+    desc.stages[6] = {};
+
     // A description the proxy cannot read is refused before the factory sees it, and does not fall back either.
     g_factory_result = S_OK;
     void* reserved = VirtualAlloc(nullptr, 0x10000, MEM_RESERVE, PAGE_NOACCESS);

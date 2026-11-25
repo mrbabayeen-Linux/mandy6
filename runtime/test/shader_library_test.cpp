@@ -524,6 +524,12 @@ int fspx_checks() {
     no_prologue[14] ^= 0x01;  // word 3: bits 31..16 no longer 0xD580
     CHECK(compute_program(no_prologue).kind == Kind::none);
     CHECK(compute_program(std::vector<std::uint8_t>(code.begin(), code.begin() + 35)).kind == Kind::none);
+    std::vector<std::uint8_t> short_code;
+    for (const auto word : {0xd5800000u, 0x03fe0100u, 1u, 0xd5800000u, 0x03fe0100u, 2u, 0xbf810000u})
+        put32(short_code, word);
+    CHECK(compute_program(short_code).kind == Kind::fspx);
+    short_code[17] = 0;  // the second VOP3 no longer carries a literal
+    CHECK(compute_program(short_code).kind == Kind::none);
     CHECK(compute_program(bytes("not a shader")).kind == Kind::none);
     return 0;
 }

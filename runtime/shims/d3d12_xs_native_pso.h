@@ -10,14 +10,17 @@
 // stage bytecode handed on is read from the user's own carved DXBC containers, not from the description.
 //
 // Xbox native graphics pipeline state, adapted from enx/leonida's slot-57 implementation.
-// The state and stage resolution are in native_pso.h. All stage bytecode handed to D3D12
-// comes from the user's carved DXBC containers and is translated by the normal Vulkan PSO path.
+// The state and stage resolution are in native_pso.h. The Vulkan PSO path can use either the
+// user's carved DXBC container or the pipeline library's indexed native program.
 #include "../src/native_pso.h"
 #include "d3d12_xs_native_pso_fallback.h"
+#include "d3d12_trace.h"
 #include "d3d12_xs_pso_stream.h"
 #include "../src/shader_library.h"
+#include "../src/title_texture_memory.h"
 
 #include <d3d12.h>
+#include <algorithm>
 #include <atomic>
 #include <climits>
 #include <cstring>
@@ -222,67 +225,58 @@ inline void build_stream(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& pc, D3D12_SHA
 class NativeGraphicsPipelines {
 public:
     template<class Create>
-    HRESULT create(const std::filesystem::path& folder, const leonida::native_pso::GraphicsDesc& desc,
+    HRESULT create(const leonida::ShaderLibrary& library, const leonida::native_pso::GraphicsDesc& desc,
                    void** out, Create&& create_pipeline) {
         using namespace native_pipeline_detail;
         *out = nullptr;
         try {
+            const auto& folder = library.directory();
             std::call_once(load_, [&] {
                 std::ifstream file(folder / L"native_hashes.txt", std::ios::binary);
                 if (!file) {
-                    std::fprintf(stderr, "[rt] d3d12_xs: slot 57 needs native_hashes.txt from the shaders stage\n");
+                    std::fprintf(stderr, "[rt] d3d12_xs: slot 57 has no native_hashes.txt; checking indexed native programs\n");
                     return;
                 }
                 const std::string text{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
                 std::string error;
                 if (!catalog_.parse(text, &error)) std::fprintf(stderr, "[rt] d3d12_xs: slot 57: %s\n", error.c_str());
             });
-            const auto plan = np::plan(desc, catalog_);
-            if (plan.status == np::PlanStatus::malformed) return E_INVALIDARG;
-            if (plan.status != np::PlanStatus::ok) return E_NOTIMPL;
-
-            D3D12_GRAPHICS_PIPELINE_STATE_DESC pc{};
-            pc.pRootSignature = static_cast<ID3D12RootSignature*>(const_cast<void*>(desc.root_signature));
-            fill_fixed_state(plan.state, pc);
-            std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
-            for (const auto& e : plan.state.elements) {
-                elements.push_back({e.name.c_str(), e.semantic_index, static_cast<DXGI_FORMAT>(e.format), e.input_slot,
-                                    e.aligned_byte_offset, static_cast<D3D12_INPUT_CLASSIFICATION>(e.classification),
-                                    e.step_rate});
+            bool unreadable = false;
+            const auto code_stage = [&](const np::Pair& code) -> std::string_view {
+                if (!library.fspx_gfx_size()) return {};
+                if (!leonida::texture_memory_readable(reinterpret_cast<std::uintptr_t>(code.data), code.size)) {
+                    unreadable = true;
+                    return {};
+                }
+                const auto bytes = np::bytes(code);
+                if (!leonida::fspx_bare_program(bytes)) return {};
+                const auto* entry = library.find_fspx_by_code(leonida::sha256_hex(bytes));
+                return entry ? std::string_view(entry->stage) : std::string_view{};
+            };
+            auto plan = np::plan(desc, catalog_, code_stage);
+            if (plan.status != np::PlanStatus::ok) {
+                if (rt::d3d12_trace::enabled())
+                    std::fprintf(stderr, "[d3d12-trace] slot 57 block %zu: %s\n", plan.failed_block,
+                                 unreadable ? "native code range unreadable" : plan.reason);
+                return unreadable || plan.status == np::PlanStatus::malformed || plan.status == np::PlanStatus::ambiguous
+                           ? E_INVALIDARG : E_NOTIMPL;
             }
-            pc.InputLayout = {elements.data(), static_cast<UINT>(elements.size())};
 
-            std::array<Container, np::kStageBlocks> code;
-            D3D12_SHADER_BYTECODE mesh{};
-            for (const auto& stage : plan.stages) {
-                auto& bytes = code[stage.block];
-                bytes = container(folder, *stage.shader);
-                if (!bytes) return E_INVALIDARG;
-                const D3D12_SHADER_BYTECODE view{bytes->data(), bytes->size()};
-                if (stage.shader->stage == "vs") pc.VS = view;
-                else if (stage.shader->stage == "ps") pc.PS = view;
-                else if (stage.shader->stage == "gs") pc.GS = view;
-                else mesh = view;  // plan() admits only VS/PS/GS or MS/PS.
-            }
-            HRESULT hr = create_pipeline(pc, mesh, code);
-            // The decoded blend state can ask for something this device's layer does not do: blending a B4G4R4A4 target
-            // that is an RGBA8 stand-in (without_stand_in_blend). Only a pipeline that blends such a target is retried.
-            // E_NOTIMPL also stands for refusals that have nothing to do with blending (stream_unsupported: a rect list
-            // without its geometry stage, mesh limits, FullyCovered; a dual-source output that does not fit Location 0
-            // Index 1): those are returned as they are, never with a blend the title did not ask for.
-            if (hr == E_NOTIMPL && plan.state.blend) {
-                D3D12_GRAPHICS_PIPELINE_STATE_DESC retry = pc;
-                const HRESULT again = without_stand_in_blend(retry) ? create_pipeline(retry, mesh, code) : hr;
-                if (SUCCEEDED(again)) {
-                    hr = again;
-                    static std::atomic<int> logged{0};
-                    if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
-                        std::fprintf(stderr, "[rt] d3d12_xs: slot 57: the device refused blending on this pipeline's "
-                                             "B4G4R4A4 stand-in targets, so it was built with blending off on those "
-                                             "targets\n");
+            const HRESULT result = build(folder, desc, plan, create_pipeline);
+            if ((result != E_INVALIDARG && result != E_NOTIMPL && result != E_FAIL) || !library.fspx_gfx_size())
+                return result;
+
+            // A catalog entry can name a stale container, or its general translation can be refused.
+            // Retry using the indexed pipeline-specific bytes for those same stages. Preserve the other bindings.
+            bool changed = false;
+            for (auto& stage : plan.stages) {
+                const auto& code = desc.stages[stage.block].code;
+                if (stage.container && np::pair_state(code) == np::PairState::present && code_stage(code) == stage.stage) {
+                    stage.container = nullptr;
+                    changed = true;
                 }
             }
-            return hr;
+            return changed ? build(folder, desc, plan, create_pipeline) : result;
         } catch (const std::bad_alloc&) {
             return E_OUTOFMEMORY;
         } catch (const std::exception&) {
@@ -292,6 +286,67 @@ public:
 
 private:
     using Container = std::shared_ptr<const std::vector<std::uint8_t>>;
+    template<class Create>
+    HRESULT build(const std::filesystem::path& folder, const leonida::native_pso::GraphicsDesc& desc,
+                  const leonida::native_pso::Plan& plan, Create& create_pipeline) {
+        using namespace native_pipeline_detail;
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pc{};
+        pc.pRootSignature = static_cast<ID3D12RootSignature*>(const_cast<void*>(desc.root_signature));
+        fill_fixed_state(plan.state, pc);
+        std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
+        for (const auto& e : plan.state.elements) {
+            elements.push_back({e.name.c_str(), e.semantic_index, static_cast<DXGI_FORMAT>(e.format), e.input_slot,
+                                e.aligned_byte_offset, static_cast<D3D12_INPUT_CLASSIFICATION>(e.classification),
+                                e.step_rate});
+        }
+        pc.InputLayout = {elements.data(), static_cast<UINT>(elements.size())};
+
+        std::array<Container, np::kStageBlocks> code;
+        D3D12_SHADER_BYTECODE mesh{};
+        for (const auto& stage : plan.stages) {
+            auto& bytes = code[stage.block];
+            if (stage.container) {
+                bytes = container(folder, *stage.container);
+                if (!bytes) return E_INVALIDARG;
+            } else {
+                const auto raw = np::bytes(desc.stages[stage.block].code);
+                bytes = std::make_shared<std::vector<std::uint8_t>>(raw.begin(), raw.end());
+            }
+            const D3D12_SHADER_BYTECODE view{bytes->data(), bytes->size()};
+            if (stage.stage == "vs") pc.VS = view;
+            else if (stage.stage == "ps") pc.PS = view;
+            else if (stage.stage == "gs") pc.GS = view;
+            else mesh = view;  // plan() admits only VS/PS/GS or MS/PS.
+        }
+        HRESULT hr = create_pipeline(pc, mesh, code);
+        // The decoded blend state can ask for something this device's layer does not do: blending a B4G4R4A4 target
+        // that is an RGBA8 stand-in (without_stand_in_blend). Only a pipeline that blends such a target is retried.
+        // E_NOTIMPL also stands for refusals that have nothing to do with blending (stream_unsupported: a rect list
+        // without its geometry stage, mesh limits, FullyCovered; a dual-source output that does not fit Location 0
+        // Index 1): those are returned as they are, never with a blend the title did not ask for.
+        if (hr == E_NOTIMPL && plan.state.blend) {
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC retry = pc;
+            const HRESULT again = without_stand_in_blend(retry) ? create_pipeline(retry, mesh, code) : hr;
+            if (SUCCEEDED(again)) {
+                hr = again;
+                static std::atomic<int> logged{0};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+                    std::fprintf(stderr, "[rt] d3d12_xs: slot 57: the device refused blending on this pipeline's "
+                                         "B4G4R4A4 stand-in targets, so it was built with blending off on those "
+                                         "targets\n");
+            }
+        }
+        const HRESULT result = hr;
+        if (rt::d3d12_trace::enabled()) {
+            const auto raw = std::count_if(plan.stages.begin(), plan.stages.end(), [](const np::PlannedStage& s) {
+                return !s.container;
+            });
+            std::fprintf(stderr, "[d3d12-trace] slot 57 stage sources: catalog=%zu kind6=%zu hr=0x%08lx\n",
+                         plan.stages.size() - raw, static_cast<std::size_t>(raw), static_cast<unsigned long>(result));
+        }
+        return result;
+    }
+
     Container container(const std::filesystem::path& folder, const leonida::native_pso::ShaderRef& ref) {
         {
             std::lock_guard lock(mutex_);

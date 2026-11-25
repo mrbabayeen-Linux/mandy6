@@ -13,8 +13,8 @@
 //             boot. Only for a caller in a guest-mapped image (set_console_caller, below); a host caller reaches the
 //             PC CreateMetaCommand.
 //   slot 57   the native graphics pipeline state (desc, iid, out). The factory of set_device_native_graphics_factory
-//             (below) is asked first with the whole 0x108-byte description (leonida::native_pso::GraphicsDesc); when
-//             it answers E_NOTIMPL (none set, no catalogue, or a plan it cannot build) the call goes on as
+//             (below) is asked first with the whole 0x108-byte description (leonida::native_pso::GraphicsDesc).
+//             E_NOTIMPL can try the two-block path when all later blocks are empty. Without a factory, the path is
 //             DeserializeGraphicsPipelineStateX(desc, iid, out): converts the Xbox 0x68-byte native graphics PSO
 //             description (+0x00 root signature, +0x08/+0x10 state blob, +0x18/+0x20 pipeline input-layout blob,
 //             +0x28/+0x30 and +0x48/+0x50 bare RDNA2 programs, +0x38/+0x40 and +0x58/+0x60 kind-2 stage blobs) to

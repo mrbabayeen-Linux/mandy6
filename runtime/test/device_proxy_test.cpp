@@ -1348,6 +1348,12 @@ int main(int argc, char** argv) {
                   "fspx_gfx PS entry preserves stage and its spv filename, under the folder prefix");
             check(vs_entry && vs_entry->stage == "vs" && vs_entry->spv_file == "fspx_gfx/4444444444444444_libvs_00002.spv",
                   "fspx_gfx VS entry preserves stage and its spv filename, under the folder prefix");
+            const std::string shared_code(64, 'a');
+            std::ofstream(tmp_dir / "fspx_gfx" / "index.json")
+                << R"({"a":{"stage":"ps","fspx_code_sha256":")" << shared_code
+                << R"("},"b":{"stage":"vs","fspx_code_sha256":")" << shared_code << "\"}}";
+            check(lib.load_fspx_only(tmp_dir) && !lib.find_fspx_by_code(shared_code),
+                  "a raw hash assigned to two graphics stages cannot identify the stage");
             std::filesystem::remove_all(tmp_dir, ec);
         }
     }

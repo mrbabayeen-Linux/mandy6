@@ -123,9 +123,11 @@ int main(int argc, char** argv) {
 int main(int argc, char** argv) {
     const bool derived_zero = argc == 2 && std::strcmp(argv[1], "--derived-zero") == 0;
     const bool derived_restore = argc == 2 && std::strcmp(argv[1], "--derived-restore") == 0;
-    const bool native = derived_zero || derived_restore || (argc == 2 && std::strcmp(argv[1], "--native-pso") == 0);
+    const bool raw_native = argc == 2 && std::strcmp(argv[1], "--native-fspx") == 0;
     // RT-DUAL-SOURCE-BLEND: ps_m15_dual.asm's second export (SV_Target1) as the second blend source, ONE + SRC1.
     const bool dual = argc == 2 && std::strcmp(argv[1], "--dual-source") == 0;
+    const bool native = derived_zero || derived_restore || raw_native
+                        || (argc == 2 && std::strcmp(argv[1], "--native-pso") == 0) || dual;
     EXPECT(argc == 1 || native || dual);
     vktest::Device d;
     const auto device_status = d.initialize();
@@ -151,11 +153,18 @@ int main(int argc, char** argv) {
     EXPECT(library.find("vs", leonida::sha256_hex(vs_program)) && library.find("ps", leonida::sha256_hex(ps_program)));
     EXPECT(library.find("ps", leonida::sha256_hex(ps_program))->uses_code_base);
     std::optional<testfiles::ScratchDir> scratch;
+    std::vector<std::uint8_t> raw_vs, raw_ps;
     if (native) {
         scratch.emplace("leonida_native_graphics_draw");
         std::error_code ec;
         std::filesystem::copy(root_dir / "spirv", scratch->path() / "spirv", std::filesystem::copy_options::recursive, ec);
         EXPECT(!ec && write_native_catalog(scratch->path(), "vs", vs_program, ps_program));
+        if (raw_native) {
+            raw_vs = native_code(vs_program, 1, true);
+            raw_ps = native_code(ps_program, 2, false);
+            EXPECT(write_native_code_index(scratch->path() / "spirv", "vs", root_dir / "spirv/vs_m15.spv", raw_vs,
+                                           root_dir / "spirv/ps_m15.spv", raw_ps, true));
+        }
     }
 #endif
     const auto vs_container = shader_container(vs_program), ps_container = shader_container(ps_program);
@@ -256,9 +265,22 @@ int main(int argc, char** argv) {
         if (native) {
             EXPECT(FAILED(create_native_pso(device.p, root.p, pso_desc.RTVFormats[0], stale_digest, &unknown.p)) && !unknown.p);
             EXPECT(FAILED(create_native_pso(device.p, root.p, pso_desc.RTVFormats[0], np::Digest{}, &unknown.p)) && !unknown.p);
-            EXPECT(SUCCEEDED(create_native_pso(device.p, root.p, pso_desc.RTVFormats[0], producer_digest, &pso.p)) && pso.p);
+            if (raw_native) {
+                auto stale = raw_vs;
+                stale.back() ^= 1;
+                EXPECT(FAILED(create_native_pso(device.p, root.p, pso_desc.RTVFormats[0], {}, &unknown.p, stale, raw_ps)) && !unknown.p);
+                Ref<ID3D12PipelineState> recovered;
+                EXPECT(SUCCEEDED(create_native_pso(device.p, root.p, pso_desc.RTVFormats[0], stale_digest,
+                                                   &recovered.p, raw_vs, raw_ps)) && recovered.p);
+            }
+            const auto digest = raw_native ? np::Digest{} : producer_digest;
+            EXPECT(SUCCEEDED(create_native_pso(device.p, root.p, pso_desc.RTVFormats[0], digest, &pso.p, raw_vs, raw_ps)) && pso.p);
             Ref<ID3D12PipelineState> duplicate;
-            EXPECT(SUCCEEDED(create_native_pso(device.p, root.p, pso_desc.RTVFormats[0], producer_digest, &duplicate.p)));
+            EXPECT(SUCCEEDED(create_native_pso(device.p, root.p, pso_desc.RTVFormats[0], digest, &duplicate.p, raw_vs, raw_ps)));
+            if (raw_native) {
+                std::fill(raw_vs.begin(), raw_vs.end(), 0);
+                std::fill(raw_ps.begin(), raw_ps.end(), 0);  // deferred binding must still see the original code table
+            }
             EXPECT(duplicate.p && duplicate.p != pso.p);
             EXPECT(rt::d3d12::graphics_pipeline_id(pso.p) != 0 &&
                    rt::d3d12::graphics_pipeline_id(duplicate.p) == rt::d3d12::graphics_pipeline_id(pso.p));
@@ -544,11 +566,12 @@ int main(int argc, char** argv) {
                     "pixels exact\n", target_extent * target_extent - edge, target_extent * target_extent);
         return 0;
     }
-    std::printf("M1.5: translated VS+PS found by FSSM hash drew three draws; %u of %u pixels exact, %u edge "
+    std::printf("M1.5: translated VS+PS found by %s hash drew three draws; %u of %u pixels exact, %u edge "
                 "pixels on the triangle's diagonal (%u its colour, %u the clear colour). User data from a descriptor "
                 "table and root constants, V# vertex fetch from the arena, PS constants "
                 "through the code base\n",
-                target_extent * target_extent - edge, target_extent * target_extent, edge, edge_triangle, edge_clear);
+                raw_native ? "kind-6" : "FSSM", target_extent * target_extent - edge, target_extent * target_extent,
+                edge, edge_triangle, edge_clear);
 #endif
     return 0;
 }

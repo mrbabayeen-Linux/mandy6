@@ -775,16 +775,18 @@ inline std::vector<std::uint8_t> fspx_payload_from_parts(std::span<const FspxPar
     return out;
 }
 
-// Whether `code` looks like a bare kind-6 program: the 36-byte prologue of three VOP3 words with opcode 0x180
-// (bits 31..16 = 0xD580) at words 0, 3 and 6, which all 29 programs of the 1.0.2.1 DLL have (docs/fspx.md).
+// The 36-byte kind-6 prologue, or the pipeline library's two literal-bearing hash carriers
+// (24 bytes). Keep this recognition in step with tools/fspx_unpack.py::code_range.
 inline bool fspx_bare_program(std::span<const std::uint8_t> code) {
-    if (code.size() < 36 || code.size() % 4) return false;
-    for (const std::size_t word : {0u, 3u, 6u}) {
+    if (code.size() < 24 || code.size() % 4) return false;
+    const auto word = [&](std::size_t i) {
         std::uint32_t v;
-        std::memcpy(&v, code.data() + 4 * word, 4);
-        if (v >> 16 != 0xD580) return false;
-    }
-    return true;
+        std::memcpy(&v, code.data() + 4 * i, sizeof(v));
+        return v;
+    };
+    if (word(0) >> 16 != 0xD580 || word(3) >> 16 != 0xD580) return false;
+    if (code.size() >= 36 && word(6) >> 16 == 0xD580) return true;
+    return (word(1) & 0xfffe0100u) == 0x03fe0100u && (word(4) & 0xfffe0100u) == 0x03fe0100u;
 }
 
 // What a compute shader's bytecode is looked up by in the translator's index.
@@ -1075,11 +1077,14 @@ public:
 
     // Finds an FSPX program by its kind-6 SHA-256 across all stages so the stage comes from the index entry itself.
     const ShaderEntry* find_fspx_by_code(std::string_view fspx_code_sha256) const {
+        const ShaderEntry* match = nullptr;
         for (std::string_view st : {"vs", "ps", "ms", "gs", "cs"}) {
             const auto all = fspx_candidates(st, fspx_code_sha256);
-            if (!all.empty()) return all.front();
+            if (all.empty()) continue;
+            if (match) return nullptr;  // the code alone cannot distinguish two shader stages
+            match = all.front();
         }
-        return nullptr;
+        return match;
     }
 
     // The entries for a program compute_program() found, by the key of its kind (docs/fspx.md, "Build and run-time

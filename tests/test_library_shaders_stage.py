@@ -1,5 +1,4 @@
-"""make_game.py's pipeline-library step (library_shaders): the compute pipelines of the library in shaders.rpf, which
-the executable creates with Xbox device slot 67 (docs/shader_library.md, docs/fspx.md).
+"""make_game.py's pipeline-library step, for Xbox device slots 67 and 57 (docs/shader_library.md, docs/fspx.md).
 
     python -I tests/test_library_shaders_stage.py
 
@@ -65,12 +64,17 @@ class LibraryStage(unittest.TestCase):
         with open(os.path.join(spirv, "index.json"), "w", encoding="utf-8", newline="\n") as f:
             json.dump(index, f)
 
+    def compute_group(self, signature="llvm-mc 23", jobs=4, emulate=False, fallbacks=()):
+        settings = (make_game.library_settings(self.archive, signature, emulate, fallbacks)
+                    if os.path.isfile(self.archive) else None)
+        make_game.translate_library_stages(self.archive, self.work, "library", ("cs",), settings, jobs, emulate, fallbacks)
+
     def run_step(self, signature="llvm-mc 23", jobs=4, emulate=False, fallbacks=(), py=None, translate=None):
         self.calls = []
         with mock.patch.object(make_game, "py", py or self.fake_py), \
                 mock.patch.object(make_game, "translate", translate or self.fake_translate), \
                 mock.patch.object(make_game, "log", lambda *a: None):
-            make_game.library_shaders(self.game, self.work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
+            self.compute_group(signature, jobs, emulate, fallbacks)
         return [tool for tool, _ in self.calls]
 
     def test_runs_once_then_nothing(self):
@@ -92,6 +96,47 @@ class LibraryStage(unittest.TestCase):
         os.unlink(self.archive)
         self.assertEqual(self.run_step(), [])
         self.assertFalse(os.path.exists(self.spirv))
+
+    def test_graphics_only_archive_and_invalid_graphics_metadata(self):
+        programs = [prog(0x11111111), prog(0x22222222)]
+        self.write_archive(make_archive(build([(NONE, NONE, {0: (0, NONE), 1: (1, NONE)})], [], [], programs)))
+        fake_mc = os.path.join(self.tmp.name, "mc.py")
+        with open(fake_mc, "w", encoding="utf-8", newline="\n") as f:
+            f.write("print('\\ts_endpgm')\n")
+        gfx = os.path.join(self.work, "shaders", "spirv", "fspx_gfx")
+
+        def translate(disasm, out, jobs, **flags):
+            self.assertEqual(out, gfx)
+            os.makedirs(out, exist_ok=True)
+            index = {}
+            for i, stage in enumerate(("ps", "vs")):
+                name = f"lib_{stage}_{i:05d}"
+                with open(os.path.join(os.path.dirname(disasm), "fspx", name + ".code"), "rb") as f:
+                    self.assertEqual(f.read(), programs[i])
+                index[name] = {"stage": stage, "fspx_code_sha256": hashlib.sha256(programs[i]).hexdigest()}
+                with open(os.path.join(out, name + ".spv"), "wb") as f:
+                    f.write(b"synthetic module")
+            with open(os.path.join(out, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump(index, f)
+
+        with mock.patch.dict(os.environ, {"LLVM_MC": f'"{sys.executable}" "{fake_mc}"'}), \
+                mock.patch.object(make_game, "translate", side_effect=translate) as translated:
+            make_game.library_shaders(self.game, self.work, "fake-mc", 1)
+            with mock.patch.object(make_game, "py", side_effect=AssertionError("valid groups must be reused")):
+                make_game.library_shaders(self.game, self.work, "fake-mc", 1)
+            self.assertEqual(translated.call_count, 1)
+        with open(os.path.join(self.spirv, "index.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {})
+        index_path = os.path.join(gfx, "index.json")
+        with open(index_path, encoding="utf-8") as f:
+            index = json.load(f)
+        for invalid in ({"stage": "cs", "fspx_code_sha256": "a" * 64}, {"stage": "vs"}):
+            with self.subTest(invalid=invalid):
+                index["lib_vs_00001"] = invalid
+                with open(index_path, "w", encoding="utf-8", newline="\n") as f:
+                    json.dump(index, f)
+                self.assertIsNone(make_game.graphics_library_stamp(os.path.join(self.work, "shaders", "fspx_gfx"),
+                                                                   gfx, "{}"))
 
     def test_archive_that_is_gone_takes_the_old_index_with_it(self):
         self.assertEqual(self.run_step(), ["shader_library.py", "translate"])
@@ -283,8 +328,7 @@ class LibraryStage(unittest.TestCase):
         with mock.patch.object(make_game, "py", fake_py), \
                 mock.patch.object(make_game.subprocess, "Popen", side_effect=fake_popen), \
                 mock.patch.object(make_game, "log", lambda *a: None):
-            make_game.library_shaders(self.game, self.work, "llvm-mc 23", jobs=3, emulate=True,
-                                      fallbacks=("--bary-fallback",))
+            self.compute_group(jobs=3, emulate=True, fallbacks=("--bary-fallback",))
             self.assertEqual([cmd[cmd.index("--shard") + 1] for cmd in spawned], ["0/3", "1/3", "2/3"])
             for cmd in spawned:
                 self.assertIn("--no-asm", cmd)
@@ -297,8 +341,7 @@ class LibraryStage(unittest.TestCase):
             spawned.clear()
             merges.clear()
             self.write_archive(b"updated archive")
-            make_game.library_shaders(self.game, self.work, "llvm-mc 23", jobs=3, emulate=True,
-                                      fallbacks=("--bary-fallback",))
+            self.compute_group(jobs=3, emulate=True, fallbacks=("--bary-fallback",))
             self.assertEqual([cmd[cmd.index("--shard") + 1] for cmd in spawned], ["0/3", "1/3", "2/3"])
             self.assertEqual(len(merges), 1)
 
@@ -321,7 +364,7 @@ class LibraryStage(unittest.TestCase):
                 mock.patch.object(make_game, "log", lambda *a: None), \
                 mock.patch("sys.stderr", new_callable=io.StringIO) as err:
             with self.assertRaises(SystemExit):
-                make_game.library_shaders(self.game, self.work, "llvm-mc 23", jobs=2)
+                self.compute_group(jobs=2)
         self.assertIn("shard 1 exited with 2", err.getvalue())
         self.assertFalse(os.path.exists(os.path.join(self.spirv, "index.json")))
         self.assertFalse(os.path.exists(os.path.join(self.spirv, "library_build.json")))
@@ -414,7 +457,13 @@ class ShadersStageWithLibrary(unittest.TestCase):
                 elif tool == "shader_disasm.py":
                     write("s_endpgm\n", dxbc, "disasm", "shader.s")
                 elif tool == "shader_library.py":
-                    write("s_endpgm\n", work, "shaders", "library", "disasm", "lib_cs_00007.s")
+                    out = args[args.index("--out") + 1]
+                    stages = args[args.index("--stages") + 1].split(",")
+                    self.assertIn(stages, [["cs"], ["ps", "vs", "ms"]])
+                    entries = [{"file": f"lib_{s}.dxbc", "stage": s} for s in stages]
+                    write(json.dumps(entries), out, "index.json")
+                    for s in stages:
+                        write("s_endpgm\n", out, "disasm", f"lib_{s}.s")
 
             def fake_translate(disasm, spirv, jobs, emulate=False, fallbacks=()):
                 ran.append("translate")
@@ -424,6 +473,13 @@ class ShadersStageWithLibrary(unittest.TestCase):
                                                        "fspx_state_sha256": "s" * 64}}),
                           spirv, "index.json")
                     write("spv", spirv, "lib_cs_00007.spv")
+                elif os.path.basename(spirv) == "fspx_gfx":
+                    index = {}
+                    for stage in ("ps", "vs", "ms"):
+                        name = "lib_" + stage
+                        index[name] = {"stage": stage, "fspx_code_sha256": hashlib.sha256(stage.encode()).hexdigest()}
+                        write("module " + stage, spirv, name + ".spv")
+                    write(json.dumps(index), spirv, "index.json")
                 else:
                     write('{"shader": {"stage": "cs"}}', spirv, "index.json")
 
@@ -438,18 +494,40 @@ class ShadersStageWithLibrary(unittest.TestCase):
                     make_game.shaders(game, work, 2)
                 return list(ran)
 
-            self.assertEqual(stage(), ["shader_carve.py", "fssm_unpack.py", "shader_disasm.py", "translate",
-                                       "shader_library.py", "translate"])
-            self.assertEqual(translate_jobs, [(os.path.join(work, "shaders", "spirv"), 2),
-                                              (os.path.join(work, "shaders", "spirv", "library"), 2)])
+            group = ["shader_library.py", "translate"]
+            spirv = os.path.join(work, "shaders", "spirv")
+            gfx = os.path.join(spirv, "fspx_gfx")
+            groups = [(os.path.join(spirv, "library"), 2), (gfx, 2)]
+            self.assertEqual(stage(), ["shader_carve.py", "fssm_unpack.py", "shader_disasm.py", "translate"] + group * 2)
+            self.assertEqual(translate_jobs, [(spirv, 2)] + groups)
+            self.assertEqual(stage(), [])
+            # An older workspace only has the compute index. Backfill graphics without touching it or the corpus.
+            shutil.rmtree(gfx)
+            self.assertEqual(stage(), group)
+            self.assertEqual(translate_jobs, [(gfx, 2)])
+            self.assertEqual(stage(), [])
+            os.unlink(os.path.join(gfx, "lib_ms.spv"))
+            self.assertEqual(stage(), group)
+            self.assertEqual(translate_jobs, [(gfx, 2)])
+            # A truncated index still has valid keys and modules. Its build marker must reject it.
+            with open(os.path.join(gfx, "index.json"), encoding="utf-8") as f:
+                partial = json.load(f)
+            del partial["lib_ps"]
+            write(json.dumps(partial), gfx, "index.json")
+            self.assertEqual(stage(), group)
+            self.assertEqual(translate_jobs, [(gfx, 2)])
             self.assertEqual(stage(), [])
             with open(archive_path, "wb") as f:
                 f.write(b"archive v2")
-            self.assertEqual(stage(), ["shader_library.py", "translate"])
-            self.assertEqual(translate_jobs, [(os.path.join(work, "shaders", "spirv", "library"), 2)])
+            self.assertEqual(stage(), group * 2)
+            self.assertEqual(translate_jobs, groups)
             self.assertEqual(stage(), [])
             self.assertTrue(os.path.isfile(os.path.join(work, "shaders", "spirv", "index.json")))
             self.assertTrue(os.path.isfile(os.path.join(work, "shaders", "spirv", "library", "index.json")))
+            os.unlink(archive_path)
+            self.assertEqual(stage(), [])
+            self.assertFalse(os.path.exists(os.path.join(gfx, "index.json")))
+            self.assertFalse(os.path.exists(os.path.join(gfx, "library_build.json")))
 
 
 if __name__ == "__main__":

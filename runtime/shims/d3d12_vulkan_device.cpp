@@ -11637,7 +11637,7 @@ public:
             VkShaderStageFlagBits bit;
             const D3D12_SHADER_BYTECODE& code;
             const leonida::ShaderEntry* entry = nullptr;
-            std::vector<std::uint8_t> fssm;
+            std::vector<std::uint8_t> program_bytes;
             std::vector<std::uint32_t> words;
         };
         Stage stages[3] = {mesh ? Stage{"ms", VK_SHADER_STAGE_MESH_BIT_EXT, *ms}
@@ -11700,10 +11700,10 @@ public:
             if (!stage.code.pShaderBytecode || !stage.code.BytecodeLength) continue;  // no PS: depth only
             const std::span<const std::uint8_t> raw_bytes{
                 static_cast<const std::uint8_t*>(stage.code.pShaderBytecode), stage.code.BytecodeLength};
-            stage.fssm = leonida::fssm_program(raw_bytes);
+            stage.program_bytes = leonida::fssm_program(raw_bytes);
             const bool vertex = stage.bit == VK_SHADER_STAGE_VERTEX_BIT;
-            if (!stage.fssm.empty()) {
-                const std::string hash = leonida::sha256_hex(stage.fssm);
+            if (!stage.program_bytes.empty()) {
+                const std::string hash = leonida::sha256_hex(stage.program_bytes);
                 // Containers with the same program can differ in their input signature or bindings: a VS must have its
                 // inputs fed by this input layout (else the layout check below reports it).
                 stage.entry = pick_entry(library->candidates(stage.name, hash), [&](const leonida::ShaderEntry& e) {
@@ -11732,6 +11732,7 @@ public:
                                  stage.name, hash.c_str(), raw_bytes.size());
                     return stub_or(E_INVALIDARG, "graphics");
                 }
+                if (stage.entry->uses_code_base) stage.program_bytes.assign(raw_bytes.begin(), raw_bytes.end());
             } else {
                 log_once("shader bytecode holds no FSSM or FSPX program; bytes", int(stage.code.BytecodeLength));
                 return E_INVALIDARG;
@@ -12265,9 +12266,9 @@ public:
 
         if (code_stage) {
             VkDeviceSize offset = 0;
-            if (!device_.arena_allocate(code_stage->fssm.size(), 256, offset, DeviceState::arena_shader)) return E_OUTOFMEMORY;
-            std::memcpy(device_.arena.mapped + offset, code_stage->fssm.data(), code_stage->fssm.size());
-            code_bytes_ = code_stage->fssm.size();
+            if (!device_.arena_allocate(code_stage->program_bytes.size(), 256, offset, DeviceState::arena_shader)) return E_OUTOFMEMORY;
+            std::memcpy(device_.arena.mapped + offset, code_stage->program_bytes.data(), code_stage->program_bytes.size());
+            code_bytes_ = code_stage->program_bytes.size();
             code_base_ = offset;
             graphics_.code_base = offset;
         }
@@ -15328,7 +15329,7 @@ public:
     HRESULT create_native_graphics(const leonida::native_pso::GraphicsDesc& desc, REFIID iid, void** out) {
         const auto* shaders = state_.library();
         if (!shaders) return E_NOTIMPL;
-        return state_.native_graphics.create(shaders->directory(), desc, out, [&](const auto& pc, const auto& mesh, const auto& containers) {
+        return state_.native_graphics.create(*shaders, desc, out, [&](const auto& pc, const auto& mesh, const auto& containers) {
             return shared_native_graphics(pc, mesh, containers, iid, out);
         });
     }

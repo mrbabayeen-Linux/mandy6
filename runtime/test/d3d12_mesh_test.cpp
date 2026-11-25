@@ -19,6 +19,8 @@
 // No game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
+#include "d3d12_native_graphics_fixture.h"
+#include "test_temp_dir.h"
 #include "../shims/d3d12_com.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../shims/d3d12_xs_pso_stream.h"
@@ -102,7 +104,8 @@ D3D12_MESH_SHADER_TIER mesh_tier(ID3D12Device* device) {
 
 int main(int argc, char** argv) {
     const bool pc_only = argc == 2 && std::string_view(argv[1]) == "--pc-stream-only";
-    EXPECT(argc == 1 || pc_only);
+    const bool native_fspx = argc == 2 && std::string_view(argv[1]) == "--native-fspx";
+    EXPECT(argc == 1 || pc_only || native_fspx);
     EXPECT(SetEnvironmentVariableW(L"LEONIDA_XS_STREAM_ENUM", pc_only ? L"0" : L"1"));
     vktest::Device d;
     d.request_mesh_shader = true;
@@ -125,8 +128,14 @@ int main(int argc, char** argv) {
     ms_container[36 + 8 + 2] = 13;  // DXIL mesh shader kind
     ms_old_container[36 + 8 + 2] = 13;
     const auto vs_container = shader_container(vs_program);
-    const auto library = std::filesystem::temp_directory_path() / "leonida_mesh_test";
-    std::filesystem::create_directories(library);
+    testfiles::ScratchDir scratch("leonida_mesh_test");
+    const auto& library = scratch.path();
+    std::vector<std::uint8_t> raw_ms, raw_ps;
+    if (native_fspx) {
+        raw_ms = native_code(ms_program, 3, false);
+        raw_ps = native_code(ps_program, 2, true);
+        EXPECT(write_native_code_index(library, "ms", LEONIDA_TEST_MS_SPV, raw_ms, LEONIDA_TEST_PS_SPV, raw_ps, false));
+    }
     std::filesystem::copy_file(LEONIDA_TEST_MS_SPV, library / "ms_draw.spv", std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(LEONIDA_TEST_MS_SPV, library / "ms_old.spv", std::filesystem::copy_options::overwrite_existing);
     std::filesystem::copy_file(LEONIDA_TEST_PS_SPV, library / "ps_draw.spv", std::filesystem::copy_options::overwrite_existing);
@@ -229,7 +238,6 @@ int main(int argc, char** argv) {
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
     if (!d.mesh_shader) {
-        std::filesystem::remove_all(library);
         std::printf("no VK_EXT_mesh_shader on this device: only the refusal without it was checked\n");
         return 77;
     }
@@ -357,37 +365,43 @@ int main(int argc, char** argv) {
                                                : bounds_hr == E_NOTIMPL && !with_bounds.p);
         }
 
-        // A console stream: its numbering has no gap at 23, so its mesh shader is 24 (the PC's AS) and its
-        // RASTERIZER1 26 (the PC's DEPTH_STENCIL2). An AS without an MS is no PC stream, so the layer reads it with the
-        // console's numbering and makes the mesh PSO. The PC reading of the same bytes alone would refuse it.
-        D3D12_RASTERIZER_DESC1 raster1{};
-        raster1.FillMode = D3D12_FILL_MODE_SOLID;
-        raster1.CullMode = D3D12_CULL_MODE_NONE;
-        raster1.DepthClipEnable = TRUE;
-        for (int with_raster1 = 0; with_raster1 < 2; ++with_raster1) {
-            Stream console;
-            console.add(RootSubobject{.inner = root.p});
-            console.add(Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(24), D3D12_SHADER_BYTECODE>{.inner = ms});
-            console.add(PsSubobject{.inner = ps}).add(TargetsSubobject{.inner = one_target()});
-            if (with_raster1)
-                console.add(Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(26), D3D12_RASTERIZER_DESC1>{.inner = raster1});
-            console.add(MaskSubobject{.inner = UINT_MAX});
-            Ref<ID3D12PipelineState> console_pso;
-            using Create = HRESULT(WINAPI*)(ID3D12Device*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
-            const auto desc = console.desc();
-            const HRESULT console_hr = reinterpret_cast<Create>(slot(device.p, 86))(device.p, &desc, IID_PPV_ARGS(&console_pso.p));
-            if (pc_only) {
-                EXPECT(FAILED(console_hr) && !console_pso.p);
-            } else {
-                EXPECT(SUCCEEDED(console_hr) && console_pso.p);
-                // Slot 55 must also walk raw 26 as RASTERIZER1 and retain the mesh bytecode after the base is released.
-                using Derive = HRESULT(WINAPI*)(ID3D12Device*, ID3D12PipelineState*, UINT, const void*, REFIID, void**);
-                std::array<std::uint8_t, rt::d3d12_xs::kDerivedRecordSize> record{};
-                const std::uint32_t mask[] = {3, UINT_MAX};
-                std::memcpy(record.data(), mask, sizeof(mask));
-                mesh_pso.reset();
-                EXPECT(SUCCEEDED(reinterpret_cast<Derive>(slot(device.p, 55))(
-                    device.p, console_pso.p, 1, record.data(), IID_PPV_ARGS(&mesh_pso.p))) && mesh_pso.p);
+        if (native_fspx) {
+            mesh_pso.reset();
+            EXPECT(SUCCEEDED(create_native_pso(device.p, root.p, one_target().RTFormats[0], {},
+                                               &mesh_pso.p, raw_ms, raw_ps)) && mesh_pso.p);
+        } else {
+            // A console stream: its numbering has no gap at 23, so its mesh shader is 24 (the PC's AS) and its
+            // RASTERIZER1 26 (the PC's DEPTH_STENCIL2). An AS without an MS is no PC stream, so the layer reads it with the
+            // console's numbering and makes the mesh PSO. The PC reading of the same bytes alone would refuse it.
+            D3D12_RASTERIZER_DESC1 raster1{};
+            raster1.FillMode = D3D12_FILL_MODE_SOLID;
+            raster1.CullMode = D3D12_CULL_MODE_NONE;
+            raster1.DepthClipEnable = TRUE;
+            for (int with_raster1 = 0; with_raster1 < 2; ++with_raster1) {
+                Stream console;
+                console.add(RootSubobject{.inner = root.p});
+                console.add(Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(24), D3D12_SHADER_BYTECODE>{.inner = ms});
+                console.add(PsSubobject{.inner = ps}).add(TargetsSubobject{.inner = one_target()});
+                if (with_raster1)
+                    console.add(Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(26), D3D12_RASTERIZER_DESC1>{.inner = raster1});
+                console.add(MaskSubobject{.inner = UINT_MAX});
+                Ref<ID3D12PipelineState> console_pso;
+                using Create = HRESULT(WINAPI*)(ID3D12Device*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
+                const auto desc = console.desc();
+                const HRESULT console_hr = reinterpret_cast<Create>(slot(device.p, 86))(device.p, &desc, IID_PPV_ARGS(&console_pso.p));
+                if (pc_only) {
+                    EXPECT(FAILED(console_hr) && !console_pso.p);
+                } else {
+                    EXPECT(SUCCEEDED(console_hr) && console_pso.p);
+                    // Slot 55 must also walk raw 26 as RASTERIZER1 and retain the mesh bytecode after the base is released.
+                    using Derive = HRESULT(WINAPI*)(ID3D12Device*, ID3D12PipelineState*, UINT, const void*, REFIID, void**);
+                    std::array<std::uint8_t, rt::d3d12_xs::kDerivedRecordSize> record{};
+                    const std::uint32_t mask[] = {3, UINT_MAX};
+                    std::memcpy(record.data(), mask, sizeof(mask));
+                    mesh_pso.reset();
+                    EXPECT(SUCCEEDED(reinterpret_cast<Derive>(slot(device.p, 55))(
+                        device.p, console_pso.p, 1, record.data(), IID_PPV_ARGS(&mesh_pso.p))) && mesh_pso.p);
+                }
             }
         }
         // Even a known mesh FSSM must not reinterpret type 24 if the container declares another stage.
@@ -807,7 +821,6 @@ int main(int argc, char** argv) {
         fence.reset();
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
-    std::filesystem::remove_all(library);
 
     unsigned mismatches = 0;
     for (UINT row = 0; row < size; ++row) {
@@ -830,9 +843,10 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
         return 1;
     }
-    std::printf("D3D-29: mesh tier 1; mesh and VS PSOs from pipeline state streams (9 refused as invalid, 2 as not "
+    std::printf("D3D-29: mesh tier 1; %s (9 refused as invalid, 2 as not "
                 "implemented); DispatchMesh over X, Y and Z and a stream VS draw matched all %u pixels; wrong-kind "
                 "draws fail at execution, oversized grids at Close; statistics queries around mesh draws resolve\n",
+                native_fspx ? "slot-57 mesh PSO and a stream VS PSO" : "mesh and VS PSOs from pipeline state streams",
                 size * size);
     return 0;
 }

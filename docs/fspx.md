@@ -257,8 +257,9 @@ and `RSRC2`).
 
 **Slot 57 (`DeserializeGraphicsPipelineStateX`, graphics FSPX).** At one call site (measured locally), the retail
 title calls device slot 57 (`+0x1c8`) with `IID_ID3D12PipelineState` (`{765a30f3-f624-4c6f-a828-ace948622445}`) and a
-104-byte description (`+0x00..+0x60`) populated from the zlib-compressed pipeline library in `shaders.rpf`
-([shader_library.md](shader_library.md): 25,471 graphics records + 2,693 compute records):
+description populated from the zlib-compressed pipeline library in `shaders.rpf`. Its first two stage blocks
+and the preceding fields occupy the 104-byte prefix (`+0x00..+0x60`) shown below. The library contains
+25,471 graphics records and 2,693 compute records. [Pipeline library layout](shader_library.md)
 
 | Offset | Field | Measured layout |
 |---|---|---|
@@ -275,9 +276,14 @@ title calls device slot 57 (`+0x1c8`) with `IID_ID3D12PipelineState` (`{765a30f3
   2. Record 8917 (`f7808a66fb6b97c1`): state 388 B (`0x4005d808`), pipeline blob 188 B (`0x542385d2`), `ps` prog 844 (768 B, SHA-256 `947014e8b0771be5...`), `vs` prog 845 (320 B, SHA-256 `a2dce0214f82c742...`).
   3. Record 12511 (`e750e10eacb97b9c`): state 380 B (`0x4005d808`), pipeline blob 188 B (`0xfb724939`), no `ps`, `vs` prog 5636 (320 B, SHA-256 `f6bfddbad6aef3cd...`).
   In the library, the 448/768 B program at `+0x28` is the pixel shader (`ps`, paired with the 208 B stage blob) and the
-  384/320 B program at `+0x48` is the vertex shader (`vs`, paired with the 752 B stage blob). Programs are looked up by
-  `sha256(program bytes)` in `<shaders>/fspx_gfx/index.json` (`ShaderLibrary::fspx_gfx_size()`, separate from
-  `fspx_size()`), and their `stage` (`"vs"` / `"ps"` / `"ms"`) is taken from the index entry rather than the blob slot.
+  384/320 B program at `+0x48` is the vertex shader (`vs`, paired with the 752 B stage blob).
+- The Vulkan factory reads all seven stage blocks of the 0x108-byte description. A stage record's DXBC HASH
+  selects its source container through `native_hashes.txt`. A stage without a matching container identity can
+  resolve through the SHA-256 of its complete program in `<shaders>/fspx_gfx/index.json`. The indexed stage
+  identifies VS, PS or MS. A digest shared by different stages cannot select one from code alone. If a source
+  container fails validation or its PSO is refused, the factory can retry with indexed code for the same
+  stage, retaining the decoded state, input layout and root signature. `--trace-d3d12` records the number of
+  catalog and kind-6 stages submitted to the Vulkan factory and its HRESULT. [Build and coverage](shader_library.md)
 - **Measured `pipeline blob` layout (188 B = `0xbc`):**
   - `+0x00`: u32 per-PSO checksum (`0xea6f6e56` / `0x542385d2` / `0xfb724939`)
   - `+0x04`: u32 `0x1000` (constant across 2,642 blobs), `+0x08`: `0`, `+0x0c`: `1`
