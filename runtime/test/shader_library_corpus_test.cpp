@@ -7,10 +7,8 @@
 // from the DXIL/XDAT/XBCH entry, hash it and look it up under the container's stage. The stage comes from the DXIL
 // part's program header, not from index.json. Every container has to resolve to its own entry (the one named after
 // the file, or one of its `~N` duplicates) with a readable SPIR-V module, and every RPF index entry has to be reached
-// by a container. The entries from <shaders>/fspx/index.json, <shaders>/bvh/index.json and <shaders>/exe/index.json
-// are counted apart: their programs come from the FidelityFX DLL, from XboxBvhBuilder.dll and from the game
-// executable, not from the carved DXBC containers, so they are not orphans. Containers with more than one 0x0D
-// payload are
+// by a container. Auxiliary entries are counted separately, including the graphics programs of the pipeline library
+// in fspx_gfx/index.json. Containers with more than one 0x0D payload are
 // counted, and their first payload must not stand in for the last: that is the rule fssm_program follows, so a
 // regression to the first payload fails here.
 //
@@ -194,15 +192,16 @@ int main() {
 
     if (containers == 0) fail("no .dxbc containers in", dxbc_dir);
     const std::size_t rpf_entries = library.size() - library.fspx_size() - library.fspx_compute_size() -
-                                    library.bvh_size() - library.exe_size();
+                                    library.fspx_gfx_size() - library.bvh_size() - library.exe_size();
     if (reached.size() != rpf_entries)
         fail(std::to_string(reached.size() > rpf_entries ? reached.size() - rpf_entries : rpf_entries - reached.size()) +
                  " RPF index entries not matched one to one",
              spirv_dir);
-    std::printf("%zu containers, %zu RPF index entries, %zu reached, %zu FSPX index entries, %zu BVH builder index "
-                "entries, %zu executable index entries; %zu containers with more than one program; "
+    std::printf("%zu containers, %zu RPF index entries, %zu reached, %zu FSPX index entries, "
+                "%zu graphics FSPX entries, %zu BVH builder index entries, %zu executable index entries; "
+                "%zu containers with more than one program; "
                 "%zu not translated; %d failures\n",
-                containers, rpf_entries, reached.size(), library.fspx_size(), library.bvh_size(),
+                containers, rpf_entries, reached.size(), library.fspx_size(), library.fspx_gfx_size(), library.bvh_size(),
                 library.exe_size(), multi, untranslated, failures);
     if (untranslated)
         std::fprintf(stderr, "%zu container(s) have no index entry: the translator left them out, so the lookup had "
