@@ -24,6 +24,11 @@
   <a href="https://t.me/mandyport">Telegram</a>
 </p>
 
+> **Nota de la casa:** bifurcación privada con cambios locales de pruebas
+> (catálogo nativo + parches de la máquina). Qué se probó, cómo y con qué
+> llaves: **[PRUEBAS-CASA.md](PRUEBAS-CASA.md)** — nada del juego ni de
+> los shaders va en este repositorio cada quien construye lo suyo.
+
 Leonida is a static recompilation project. The Xbox Series CPU is x86-64 like a PC, so the game's code is loaded
 and run natively, and the console's system software is reimplemented. The console's precompiled RDNA2 GPU programs
 are translated to SPIR-V for Vulkan. The game's models, textures and audio are read from your package. All of this
