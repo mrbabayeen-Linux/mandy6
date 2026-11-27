@@ -3379,6 +3379,14 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
     without host-transfer usage before it is bound, and takes the staging path. `d3d12_vulkan_device_test` and
     `d3d12_subresource_copy_test` force this branch on any GPU with `VulkanDeviceInfo::force_host_transfer_retry`
     (their third CPU-copy path; the second compares it with the host runtime).
+  - `LEONIDA_HOST_IMAGE_COPY` chooses whether the device enables the extension at all (`src/host_image_copy_policy.h`,
+    tested by `host_image_copy_policy_test`): `1` wherever the device has it, `0` never, and `auto`, the default, as
+    `1` except on NVIDIA (`vendorID` `0x10DE`), where it is off. On an RTX 4070 SUPER (Windows 11) a real boot lost
+    the device with `WRITE_INVALID` in 7 of 7 runs that used host image copies and in 0 of 2 that did not; why is
+    still under investigation. Off, the extension is neither enabled nor chained, no texture gets host-transfer
+    usage, and every copy takes the staging path, as on a device without the extension. Device creation logs one
+    line, `[rt] d3d12: host image copy: on (available)` or `off (...)` with the reason. Results with
+    `LEONIDA_HOST_IMAGE_COPY=1` on other NVIDIA GPUs and drivers are welcome in an issue.
 - 96-bit textures (`R32G32B32_FLOAT`/`_UINT`/`_SINT`/`_TYPELESS`, D3D-62) are `R32G32B32A32` images
   (`ResourceBinding::rgb96`), on every GPU. Most GPUs have no optimal-tiling RGB32 image (an RX 9070 XT reports
   no optimal features for `R32G32B32_SFLOAT`), and one that has would not avoid the repack: D3D12 places

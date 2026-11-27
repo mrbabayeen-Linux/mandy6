@@ -757,6 +757,30 @@ constexpr DXGI_MODE_ROTATION rotation_from_dm(const DEVMODEW& dm) noexcept {
     }
 }
 
+// PATCH LOCAL (casa): LEONIDA_DISPLAY_MAX=WxH miente el tamaño de la pantalla al título
+// (la misma clase del disfraz de placa LEONIDA_ADAPTER): sin la variable, todo pasa igual.
+namespace {
+struct DisplayCap { unsigned w = 0, h = 0; bool set = false; };
+const DisplayCap& display_cap() {
+    static DisplayCap cap;
+    static const bool ready = [] {
+        char env[32]{};
+        if (GetEnvironmentVariableA("LEONIDA_DISPLAY_MAX", env, sizeof(env)) > 0) {
+            unsigned w = 0, h = 0;
+            if (std::sscanf(env, "%ux%u", &w, &h) == 2 && w >= 320 && h >= 240) {
+                cap.w = w;
+                cap.h = h;
+                cap.set = true;
+                std::fprintf(stderr, "[rt] dxgi: display modes lie at %ux%u as asked (LEONIDA_DISPLAY_MAX)\n", w, h);
+            }
+        }
+        return true;
+    }();
+    (void)ready;
+    return cap;
+}
+}  // namespace
+
 BOOL CALLBACK collect_monitor_cb(HMONITOR hmon, HDC, LPRECT, LPARAM lparam) {
     auto* displays = reinterpret_cast<std::vector<DisplayInfo>*>(lparam);
     MONITORINFOEXW mi{};
@@ -782,6 +806,17 @@ BOOL CALLBACK collect_monitor_cb(HMONITOR hmon, HDC, LPRECT, LPARAM lparam) {
         if ((dm.dmFields & DM_DISPLAYFREQUENCY) != 0 && dm.dmDisplayFrequency > 1)
             info.current_refresh_hz = dm.dmDisplayFrequency;
         info.rotation = rotation_from_dm(dm);
+    }
+    if (const DisplayCap& cap = display_cap(); cap.set) {  // PATCH LOCAL: el título ve la pantalla chica
+        if (info.current_width > cap.w) info.current_width = cap.w;
+        if (info.current_height > cap.h) info.current_height = cap.h;
+        const LONG cw = mi.rcMonitor.right - mi.rcMonitor.left;
+        const LONG ch = mi.rcMonitor.bottom - mi.rcMonitor.top;
+        if (cw > static_cast<LONG>(cap.w) || ch > static_cast<LONG>(cap.h)) {
+            mi.rcMonitor.right = mi.rcMonitor.left + std::min(cw, static_cast<LONG>(cap.w));
+            mi.rcMonitor.bottom = mi.rcMonitor.top + std::min(ch, static_cast<LONG>(cap.h));
+        }
+        info.desktop_coords = mi.rcMonitor;
     }
 
     displays->push_back(info);
@@ -829,6 +864,10 @@ std::vector<DXGI_MODE_DESC> collect_modes(const DisplayInfo& info, DXGI_FORMAT f
 
     std::set<std::tuple<UINT, UINT, UINT>> seen;
     auto push_mode = [&](UINT w, UINT h, UINT hz) {
+        if (const DisplayCap& cap = display_cap(); cap.set) {  // PATCH LOCAL: modos capados, la lista nunca queda vacía
+            w = std::min(w, cap.w);
+            h = std::min(h, cap.h);
+        }
         if (!w || !h || !hz) return;
         if (!seen.emplace(w, h, hz).second) return;
         DXGI_MODE_DESC m{};

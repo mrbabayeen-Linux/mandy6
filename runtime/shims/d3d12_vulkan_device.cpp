@@ -72,6 +72,7 @@
 #include "../src/title_window_plan.h"
 #include "../src/vulkan_present.h"
 #include "../src/vulkan_device_filter.h"
+#include "../src/host_image_copy_policy.h"
 #include "../src/vulkan13_features.h"
 #include "../src/vulkan_index_view.h"
 #include "d3d12_compute_input_probe.h"
@@ -22005,13 +22006,17 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         vkGetPhysicalDeviceFeatures2(info.physical, &query);
     }
     const char* host_image_copy_name = VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME;
-    info.host_image_copy = has_host_image_copy && host_copy.hostImageCopy;
+    // LEONIDA_HOST_IMAGE_COPY (src/host_image_copy_policy.h). Off, the extension is neither enabled nor chained, so no
+    // image gets host-transfer usage and every CPU texture copy takes the staging submit, as on a device without it.
+    const leonida::HostImageCopyChoice host_copy_choice = leonida::host_image_copy_choice(
+        std::getenv("LEONIDA_HOST_IMAGE_COPY"), has_host_image_copy && host_copy.hostImageCopy, chosen.vendorID);
+    info.host_image_copy = host_copy_choice.use;
     if (info.host_image_copy) {
         host_copy.pNext = *v13.next();  // after the conditional rendering features, if any
         *v13.next() = &host_copy;
-    } else {
-        std::fprintf(stderr, "[rt] d3d12: no VK_EXT_host_image_copy; CPU texture copies use a staging submit\n");
     }
+    std::fprintf(stderr, "[rt] d3d12: host image copy: %s (%s)%s\n", info.host_image_copy ? "on" : "off",
+                 host_copy_choice.reason, info.host_image_copy ? "" : "; CPU texture copies use a staging submit");
 
     const auto has_device_extension = [&](const char* name) {
         return std::any_of(extensions.begin(), extensions.end(),

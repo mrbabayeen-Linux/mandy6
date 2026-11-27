@@ -229,9 +229,13 @@ else
   echo "warning: no --device: Mesa picks the Vulkan device (pass --device VID:DID to pin it)" >&2
 fi
 export WINEPREFIX=${PREFIX:-$RUN/prefix} WINEDEBUG=${WINEDEBUG:--all}
+# PATCH LOCAL (casa): con LEONIDA_SOUND=1 el sonido queda prendido
+# (no se silencian los controladores de audio ni se sirve el final silencioso).
+if [ "${LEONIDA_SOUND:-0}" != "1" ]; then
 export WINEDLLOVERRIDES="winedbg.exe=d;winemenubuilder.exe=d;winepulse.drv=d;winealsa.drv=d;wineoss.drv=d;winecoreaudio.drv=d"
 export PULSE_SERVER=unix:/nonexistent PIPEWIRE_REMOTE=/nonexistent ALSA_CONFIG_PATH=/dev/null SDL_AUDIODRIVER=dummy
 export LEONIDA_AUDIO=silent
+fi
 export LEONIDA_D3D12=${LEONIDA_D3D12:-vulkan}
 export LEONIDA_RUMBLE=${LEONIDA_RUMBLE:-0}
 export LEONIDA_SAVE_DIR=${LEONIDA_SAVE_DIR:-Z:$RUN/saves}
