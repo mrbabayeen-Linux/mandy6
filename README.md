@@ -24,7 +24,7 @@
   <a href="https://t.me/mandyport">Telegram</a>
 </p>
 
-> **Nota de la casa:** bifurcación privada con cambios locales de pruebas
+> **Nota de la casa:** bifurcación de pruebas con cambios locales
 > (catálogo nativo + parches de la máquina). Qué se probó, cómo y con qué
 > llaves: **[PRUEBAS-CASA.md](PRUEBAS-CASA.md)** — nada del juego ni de
 > los shaders va en este repositorio cada quien construye lo suyo.
